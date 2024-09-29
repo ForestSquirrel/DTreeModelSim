@@ -5,6 +5,7 @@ classdef DendriteTreeModel
         Stimuli         % Cell array of stimuli
         Connectivity    % Struct array representing connections
         h               % Integration step size
+        coupling_matrix % Matrix for sparse computations
         id_to_idx       % Mapping from ID to index
     end
 
@@ -167,6 +168,7 @@ classdef DendriteTreeModel
 
         function obj = buildModel(obj, h)
             obj.h = h;
+            obj = obj.preprocessStimuli();
             % The model is ready for simulation after this step
         end
 
@@ -197,11 +199,7 @@ classdef DendriteTreeModel
                 Stim = 0;
                 StimSignal = obj.Stimuli{idx};
                 if ~isempty(StimSignal)
-                    if isa(StimSignal, 'function_handle')
-                        Stim = StimSignal(t);
-                    elseif isnumeric(StimSignal) % Stimulus is an array
-                        Stim = interp_point_by_point(StimSignal, t, obj.h);
-                    end
+                    Stim = StimSignal(t);
                 end
                 % Compute RHS
                 if dendrite.ID == 0 % Soma
@@ -213,6 +211,104 @@ classdef DendriteTreeModel
                 dxdt(i+1) = dVdt;
             end
         end
+
+        %%%%%% Sparse computations functions %%%%%%
+        function dxdt = sparseRHS(obj, t, x)
+            N = obj.numDendrites;
+            U = x(1:2:end);
+            V = x(2:2:end);
+
+            % Pre-extract parameters
+            params = [obj.dendrites.params];
+            alpha = [params.alpha]';
+            b = [params.b]';
+            Tau = [params.Tau]';
+            TauR = [params.TauR]';
+            NaX = [params.NaX]';
+            gc = [params.gc]';
+
+            % Precompute coupling matrix if not already done
+            if isempty(obj.coupling_matrix)
+                obj.coupling_matrix = buildCouplingMatrix(obj);
+            end
+            C = obj.coupling_matrix;
+
+            % Compute coupling term
+            coupling_term = C * U - sum(C, 2) .* U;
+
+            Stim = zeros(N, 1);
+            for idx = 1:N
+                StimSignal = obj.Stimuli{idx};
+                if ~isempty(StimSignal)
+                    Stim(idx) = StimSignal(t);
+                end
+            end
+
+            % Compute derivatives
+            dUdt = Tau .* (NaX .* (U .* (U - 1) .* (1 - alpha .* U) - V) + coupling_term + Stim);
+            dVdt = TauR .* b .* U;
+
+            % Combine derivatives
+            dxdt = zeros(size(x));
+            dxdt(1:2:end) = dUdt;
+            dxdt(2:2:end) = dVdt;
+        end
+
+        function C = buildCouplingMatrix(obj)
+            N = obj.numDendrites;
+            % Estimate the total number of non-zero entries
+            nonZeroEntries = 0;
+            for i = 1:N
+                conn = obj.Connectivity(i);
+                nonZeroEntries = nonZeroEntries + length(conn.List_Proximal) + length(conn.List_Distal);
+            end
+
+            % Preallocate arrays for the non-zero entries
+            rows = zeros(nonZeroEntries, 1);
+            cols = zeros(nonZeroEntries, 1);
+            vals = zeros(nonZeroEntries, 1);
+
+            % Index for inserting into preallocated arrays
+            idx = 1;
+            for i = 1:N
+                conn = obj.Connectivity(i);
+                gc_i = obj.dendrites(i).params.gc;
+                % Proximal connections
+                for pid = conn.List_Proximal
+                    pidx = obj.getDendriteIndex(pid);
+                    rows(idx) = i;
+                    cols(idx) = pidx;
+                    vals(idx) = gc_i;
+                    idx = idx + 1;
+                end
+                % Distal connections
+                for did = conn.List_Distal
+                    didx = obj.getDendriteIndex(did);
+                    rows(idx) = i;
+                    cols(idx) = didx;
+                    vals(idx) = gc_i;
+                    idx = idx + 1;
+                end
+            end
+
+            % Create the sparse coupling matrix
+            C = sparse(rows, cols, vals, N, N);
+        end
+        function obj = preprocessStimuli(obj)
+            % Preprocess stimuli to ensure they can be evaluated efficiently during RHS computation
+            for idx = 1:obj.numDendrites
+                StimSignal = obj.Stimuli{idx};
+                if ~isempty(StimSignal)
+                    if isnumeric(StimSignal)
+                        % Create a griddedInterpolant for efficient interpolation
+                        time_vector = 0:1:(length(StimSignal)-1);
+                        F = griddedInterpolant(time_vector.*obj.h, StimSignal, 'pchip', 'pchip');
+                        obj.Stimuli{idx} = F;
+                    end
+                end
+            end
+        end
+
         %%%%%%% MISC %%%%%%%%%%%%%%%%
         function verify(obj)
             % Verify that all dendrites are connected to the soma (ID = 0)
@@ -261,42 +357,172 @@ classdef DendriteTreeModel
             end
             % If everything is connected, do nothing
         end
-        %%%%%%% VISUALIZATION %%%%%%%
-        function G = makeGraph(obj)
-            % Method to create a digraph object representing the dendritic tree
-            sourceNodes = [];
-            targetNodes = [];
 
-            % Loop through dendrites to extract connections
+        %%%%%% Force-Directed 3D %%%%%%
+        function visualizeFDGL(obj, maxIterations, eps)
+            % visualizeFDGL (force-directed graph layout) performs a force-directed layout with
+            % spherical initialization and convergence criteria.
+            %
+            % Inputs:
+            % - maxIterations: Maximum number of iterations for the algorithm
+            % - eps: Convergence threshold for the total energy
+
+            % Constants for force calculation
+            K_attraction = .2;    % Spring constant for attraction (tune as necessary)
+            K_repulsion = .2;   % Constant for repulsion (tune as necessary)
+            timestep = .2;     % Time step for updating positions (tune as necessary)
+
+            % Assign initial positions using spherical initialization
+            [nodePositions, nodeSizes] = obj.sphericalInitialization();
+
+            % Get edges
+            [sourceNodes, targetNodes] = obj.getEdges();
+
+            % Iterative force calculation with convergence check
+            for iter = 1:maxIterations
+                % Initialize force accumulators
+                forces = zeros(obj.numDendrites, 3);
+                totalEnergy = 0; % Track total energy for convergence check
+
+                % Calculate repulsive forces between all pairs of nodes
+                for i = 1:obj.numDendrites
+                    for j = i+1:obj.numDendrites
+                        diff = nodePositions(i, :) - nodePositions(j, :);
+                        dist = norm(diff);
+                        if dist > 0
+                            repulsiveForce = K_repulsion * (diff / dist^2);
+                            forces(i, :) = forces(i, :) + repulsiveForce;
+                            forces(j, :) = forces(j, :) - repulsiveForce;
+                            totalEnergy = totalEnergy + K_repulsion / dist; % Repulsive energy
+                        end
+                    end
+                end
+
+                % Calculate attractive forces along the edges
+                for e = 1:length(sourceNodes)
+                    sourceIdx = obj.getDendriteIndex(sourceNodes(e));
+                    targetIdx = obj.getDendriteIndex(targetNodes(e)); % Corrected line
+                    diff = nodePositions(sourceIdx, :) - nodePositions(targetIdx, :);
+                    dist = norm(diff);
+                    if dist > 0 % Prevent division by zero
+                        attractiveForce = -K_attraction * (diff / dist); % Hooke's law
+                        forces(sourceIdx, :) = forces(sourceIdx, :) + attractiveForce;
+                        forces(targetIdx, :) = forces(targetIdx, :) - attractiveForce;
+                        totalEnergy = totalEnergy + 0.5 * K_attraction * dist^2; % Attractive energy
+                    end
+                end
+
+                % Update node positions based on forces, but don't update the soma (ID = 0)
+                for i = 2:obj.numDendrites  % Start from node 2 to skip the soma
+                    nodePositions(i, :) = nodePositions(i, :) + timestep * forces(i, :);
+                end
+
+                % Keep the soma fixed at the origin
+                nodePositions(1, :) = [0, 0, 0];
+
+                % Check for convergence: if total energy is below epsilon, stop iterating
+                if totalEnergy <= eps
+                    fprintf('Converged after %d iterations with energy: %f\n', iter, totalEnergy);
+                    break;
+                end
+            end
+
+            % Prepare colors for nodes
+            nodeColors = zeros(obj.numDendrites, 3); % RGB colors
+
+            % Define colors
+            somaColor = [1, 0, 0]; % Red for soma
+            stimulatedColor = [0, 1, 0]; % Green for stimulated dendrites
+            defaultColor = [0, 0, 1]; % Blue for other dendrites
             for i = 1:obj.numDendrites
-                currentID = obj.dendrites(i).ID;
-                conn = obj.Connectivity(i);
-
-                % Proximal connections (edges from connected dendrites to current dendrite)
-                for pid = conn.List_Proximal
-                    sourceNodes(end+1) = pid;
-                    targetNodes(end+1) = currentID;
-                end
-
-                % Distal connections (edges from current dendrite to connected dendrites)
-                for did = conn.List_Distal
-                    sourceNodes(end+1) = currentID;
-                    targetNodes(end+1) = did;
+                if obj.dendrites(i).ID == 0
+                    % Soma
+                    nodeColors(i, :) = somaColor;
+                    nodeSizes(i) = nodeSizes(i) * 2; % Make soma larger
+                elseif ~isempty(obj.Stimuli{i})
+                    % Dendrites receiving stimuli
+                    nodeColors(i, :) = stimulatedColor;
+                else
+                    % Default dendrites
+                    nodeColors(i, :) = defaultColor;
                 end
             end
 
-            % Create a digraph object
-            G = digraph(sourceNodes, targetNodes);
+            % Plot the resulting layout
+            figure;
+            scatter3(nodePositions(:, 1), nodePositions(:, 2), nodePositions(:, 3), nodeSizes, nodeColors, 'filled');
+            hold on;
 
-            % Assign node labels
-            nodeIDs = [obj.dendrites.ID];
-            nodeLabels = arrayfun(@(id) sprintf('Dendrite %d', id), nodeIDs, 'UniformOutput', false);
-            somaIdx = find(nodeIDs == 0);
-            if ~isempty(somaIdx)
-                nodeLabels{somaIdx} = 'Soma'; % Label the soma
+            % Add labels
+            % Prepare labels
+            labels = cell(obj.numDendrites, 1);
+            for i = 1:obj.numDendrites
+                ID = obj.dendrites(i).ID;
+                if ID == 0
+                    labels{i} = 'Soma';
+                else
+                    labels{i} = sprintf('Dendrite %d', ID);
+                end
             end
-            G.Nodes.Name = nodeLabels';
+            % Add labels
+            for i = 1:obj.numDendrites
+                text(nodePositions(i, 1), nodePositions(i, 2), nodePositions(i, 3), [' ' labels{i}], 'FontSize', 10);
+            end
+
+            % Plot edges
+            for e = 1:length(sourceNodes)
+                sourceIdx = obj.getDendriteIndex(sourceNodes(e));
+                targetIdx = obj.getDendriteIndex(targetNodes(e));
+                plot3([nodePositions(sourceIdx, 1), nodePositions(targetIdx, 1)], ...
+                    [nodePositions(sourceIdx, 2), nodePositions(targetIdx, 2)], ...
+                    [nodePositions(sourceIdx, 3), nodePositions(targetIdx, 3)], 'k-');
+            end
+
+            title('Force-Directed 3D Visualization of Dendritic Tree');
+            grid on;
+            axis equal;
+            rotate3d on;
         end
+
+        function [nodePositions, nodeSizes] = sphericalInitialization(obj)
+            % Spherical initialization: evenly distribute nodes in 3D space around a sphere
+            %
+            % Outputs:
+            % - nodePositions: Nx3 array of initial 3D positions for each node
+            % - nodeSizes: Node sizes for visualization
+
+            numNodes = obj.numDendrites;
+            nodePositions = zeros(numNodes, 3);
+            nodeSizes = zeros(numNodes, 1);
+
+            % Parameters
+            radius = 10; % Arbitrary radius for the sphere
+
+            % Initialize positions for each node on a sphere (except soma)
+            for i = 2:numNodes
+                theta = pi * rand();   % Elevation angle
+                phi = 2 * pi * rand(); % Azimuthal angle
+                r = radius * (0.8 + 0.2 * rand()); % Random distance from center (slightly varied)
+
+                nodePositions(i, 1) = r * sin(theta) * cos(phi); % x-coordinate
+                nodePositions(i, 2) = r * sin(theta) * sin(phi); % y-coordinate
+                nodePositions(i, 3) = r * cos(theta);            % z-coordinate
+            end
+
+            % Set the soma (ID = 0) at the center
+            nodePositions(1, :) = [0, 0, 0];
+
+            % Assign node sizes (optional, can be based on other properties)
+            for i = 1:numNodes
+                if obj.dendrites(i).ID == 0
+                    nodeSizes(i) = 100; % Larger size for the soma
+                else
+                    nodeSizes(i) = 100*obj.dendrites(i).params.NaX; % Default size for other dendrites
+                end
+            end
+        end
+
+        %%%%%%% 3D tree %%%%%%%
 
         function [nodePositions, nodeSizes] = assignSpatialCoordinates(obj)
             % Initialize positions and sizes arrays
@@ -332,7 +558,7 @@ classdef DendriteTreeModel
                         NaX = dendrite.params.NaX;
 
                         % Calculate node size based on NaX
-                        nodeSizes(childIdx) = NaX * 1000; % Scale factor for visualization
+                        nodeSizes(childIdx) = NaX * 100; % Scale factor for visualization
 
                         % Calculate branch length based on gc
                         baseLength = 1; % Base length
@@ -378,6 +604,176 @@ classdef DendriteTreeModel
                 end
             end
         end
+        function visualize3D(obj)
+            % Assign spatial coordinates and node sizes
+            [nodePositions, nodeSizes] = obj.assignSpatialCoordinates();
 
+            % Get edges
+            [sourceNodes, targetNodes] = obj.getEdges();
+
+            % Create a mapping from IDs to indices
+            idList = [obj.dendrites.ID];
+            idToIndex = containers.Map(idList, 1:length(idList));
+
+            % Prepare labels
+            labels = cell(obj.numDendrites, 1);
+            for i = 1:obj.numDendrites
+                ID = obj.dendrites(i).ID;
+                if ID == 0
+                    labels{i} = 'Soma';
+                else
+                    labels{i} = sprintf('Dendrite %d', ID);
+                end
+            end
+
+            % Prepare colors for nodes
+            nodeColors = zeros(obj.numDendrites, 3); % RGB colors
+
+            % Define colors
+            somaColor = [1, 0, 0]; % Red for soma
+            stimulatedColor = [0, 1, 0]; % Green for stimulated dendrites
+            defaultColor = [0, 0, 1]; % Blue for other dendrites
+
+            % Assign colors
+            for i = 1:obj.numDendrites
+                if idList(i) == 0
+                    % Soma
+                    nodeColors(i, :) = somaColor;
+                    nodeSizes(i) = nodeSizes(i) * 2; % Make soma larger
+                elseif ~isempty(obj.Stimuli{i})
+                    % Dendrites receiving stimuli
+                    nodeColors(i, :) = stimulatedColor;
+                else
+                    % Default dendrites
+                    nodeColors(i, :) = defaultColor;
+                end
+            end
+
+            % Plot nodes
+            figure;
+            scatter3(nodePositions(:,1), nodePositions(:,2), nodePositions(:,3), nodeSizes, nodeColors, 'filled');
+            hold on;
+
+            % Label nodes
+            for i = 1:length(idList)
+                text(nodePositions(i,1), nodePositions(i,2), nodePositions(i,3), sprintf('  %s', labels{i}), 'FontSize', 10);
+            end
+
+            % Plot edges
+            numEdges = length(sourceNodes);
+            for i = 1:numEdges
+                sourceID = sourceNodes(i);
+                targetID = targetNodes(i);
+                sourceIdx = idToIndex(sourceID);
+                targetIdx = idToIndex(targetID);
+                sourcePos = nodePositions(sourceIdx, :);
+                targetPos = nodePositions(targetIdx, :);
+                % Adjust line width based on conductance (gc)
+                gc = obj.dendrites(sourceIdx).params.gc;
+                lineWidth = gc * 0.5; % Scale factor for visualization
+                plot3([sourcePos(1), targetPos(1)], [sourcePos(2), targetPos(2)], [sourcePos(3), targetPos(3)], 'k-', 'LineWidth', lineWidth);
+            end
+
+            % Customize plot
+            title('3D Visualization of Dendritic Tree');
+            grid on;
+            axis equal;
+            rotate3d on;
+        end
+
+        %%%%% CPP stuff %%%%%%
+        function [t, solution] = RK4CPP(obj, tmax)
+            % RK4CPP prepares the data for the MEX function and runs the simulation
+            %
+            % Inputs:
+            % - tmax: Maximum simulation time
+            %
+            % Outputs:
+            % - t: Time vector
+            % - solution: Simulated state variables over time
+
+            % Prepare time vector
+            h = obj.h;
+            t = 0:h:tmax;
+            numTimeSteps = length(t);
+
+            % Get initial conditions
+            X0 = obj.getInitCon(); % Should be a column vector
+
+            % Prepare dendrite parameters
+            numDendrites = obj.numDendrites;
+            % Columns: [alpha, b, Tau, TauR, NaX, gc, ID]
+            paramsArray = zeros(numDendrites, 7);
+
+            for idx = 1:numDendrites
+                dendrite = obj.dendrites(idx);
+                paramsArray(idx, :) = [
+                    dendrite.params.alpha, dendrite.params.b, dendrite.params.Tau, ...
+                    dendrite.params.TauR, dendrite.params.NaX, dendrite.params.gc, dendrite.ID
+                    ];
+            end
+
+            % Prepare coupling matrix data
+            % Ensure the coupling matrix is built
+            if isempty(obj.coupling_matrix)
+                obj.coupling_matrix = obj.buildCouplingMatrix();
+            end
+            C = obj.coupling_matrix; % Sparse matrix
+
+            % Convert the sparse matrix to COO format (row, col, value)
+            [rowIndices, colIndices, values] = find(C);
+            % Adjust indices for zero-based indexing in C++
+            couplingData = [rowIndices - 1, colIndices - 1, values]; % Nx3 matrix
+
+            % Prepare stimuli data
+            % Identify dendrites with stimuli
+            stimDendriteIDs = [];
+            StimuliMatrix = [];
+            stimDendriteIDtoIndex = containers.Map('KeyType', 'int32', 'ValueType', 'int32');
+            stimIdx = 1;
+
+            for idx = 1:numDendrites
+                StimSignal = obj.Stimuli{idx};
+                if ~isempty(StimSignal)
+                    dendriteID = obj.dendrites(idx).ID;
+                    stimDendriteIDs(end+1) = dendriteID;
+                    % Evaluate stimuli at all time steps
+                    StimValues = zeros(1, numTimeSteps);
+                    for k = 1:numTimeSteps
+                        tt = t(k);
+                        StimValue = StimSignal(tt);
+                        if isnan(StimValue)
+                            StimValue = 0;
+                        end
+                        StimValues(k) = StimValue;
+                    end
+                    % Append to StimuliMatrix
+                    StimuliMatrix = [StimuliMatrix; StimValues];
+                    % Map dendrite ID to row index in StimuliMatrix
+                    stimDendriteIDtoIndex(dendriteID) = stimIdx;
+                    stimIdx = stimIdx + 1;
+                end
+            end
+
+            % Prepare mapping from dendrite IDs to indices (zero-based for C++)
+            dendriteIDtoIndex = containers.Map('KeyType', 'int32', 'ValueType', 'int32');
+            for idx = 1:numDendrites
+                dendriteID = obj.dendrites(idx).ID;
+                % Subtract 1 for zero-based indexing in C++
+                dendriteIDtoIndex(dendriteID) = idx - 1;
+            end
+
+            % Convert maps to arrays for passing to C++
+            stimDendriteIDArray = stimDendriteIDs;
+            dendriteIDArray = [obj.dendrites.ID];
+
+            % Run the MEX function
+            % Assuming the MEX function is named 'mexRK4Solver' and has the appropriate signature
+            [t, solution] = mexRK4Solver(paramsArray, couplingData, StimuliMatrix, stimDendriteIDArray, X0, h, numTimeSteps, dendriteIDArray);
+
+            % The solution returned should be an array of size [numStateVars x numTimeSteps]
+            % where numStateVars = numDendrites * 2 (for u and v variables)
+
+        end
     end
 end
