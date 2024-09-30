@@ -17,6 +17,8 @@ This repository contains a MATLAB implementation of a dendritic tree model for s
   - [Running Simulations](#running-simulations)
   - [Visualization](#visualization)
 - [Project Structure](#project-structure)
+- [Changelog](#changelog)
+- [Future Plans](#futute-plans) 
 
 ## Overview
 
@@ -176,3 +178,43 @@ legend(arrayfun(@(d) sprintf('Dendrite %d', d.ID), model.dendrites, 'UniformOutp
 - ``soma_rhs.m``: Function defining the RHS of the ODEs for the soma.
 - ``dendrite_rhs.m``: Function defining the RHS of the ODEs for the dendrites.
 - ``README.md``: Project documentation (this file).
+
+## Changelog
+
+### [??.??.??] - Next update incoming soon
+- **New**:
+- **Updated**:
+- **Fixed**:
+- **Removed**:
+
+---
+
+### [29.09.24] - Finally on git
+
+## Future Plans
+- Restructure project:
+  ```
+  main
+  |-src
+  | |-matlab
+  | | |-*.m
+  | |-cpp
+  |   |-*.cpp
+  |-examples
+  | |-*.m examples, covering full functionality
+  |-compiled
+  | |-*.mexw64
+  |-readme
+  ```
+- Soma-only usage (validate if everything works with current setup, probably some bulky fixes)
+  - Optimize
+- Results interpreter (probably 'll make some ``.m`` scripts as a starting point
+  - Save results in some model-associated way
+  - Methods for different plots
+- Optional log from cpp
+- Snapshots
+  - Save model & simulation results in some convenient way (probably after Results interpreter is implemented)
+- Check is mex's are compiled on init
+- A guide on how to change neuron model
+  - Probably a massive overhaul of the project & built-in different models
+- Some other cool stuff
